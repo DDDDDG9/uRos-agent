@@ -1,117 +1,262 @@
 #include <micro_ros_arduino.h>
 #include <CytronMotorDriver.h>
+#include <MPU6050_light.h>
 
 #include <stdio.h>
+#include <Wire.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 
 #include <geometry_msgs/msg/twist.h>
+#include <sensor_msgs/msg/joint_state.h>
+
+// === Motor driver pins ===
+CytronMD motorL(PWM_PWM, 26, 27);  // Left motor
+CytronMD motorR(PWM_PWM, 32, 33);  // Right motor
+
+#define LEFT_ENCODER_PIN 17  // Left encoder input pin
+#define ENCODER_TICKS_PER_REV 133
+
+// === Micro-ROS variables ===
+rcl_publisher_t joint_state_pub;
+sensor_msgs__msg__JointState joint_state_msg;
 
 rcl_subscription_t twist_subscriber;
 geometry_msgs__msg__Twist twist_msg;
+
+rcl_subscription_t cmd_sub;
+sensor_msgs__msg__JointState command_msg;
+
 rclc_executor_t executor;
 rcl_allocator_t allocator;
 rclc_support_t support;
 rcl_node_t node;
+rcl_timer_t timer;
 
-// Configure the motor driver.
-CytronMD motorL(PWM_PWM, 26, 27);   // PWM 1A = Pin 26, PWM 1B = Pin 27.
-CytronMD motorR(PWM_PWM, 14, 12);  // PWM 2A = Pin 14, PWM 2B = Pin 12.
+// === IMU ===
+MPU6050 mpu(Wire);
 
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
+// === Encoder state ===
+volatile int32_t left_encoder_count = 0;
+int32_t prev_encL_ticks = 0;
+float imu_yaw = 0;
+unsigned long prev_time_ms = 0;
+unsigned long last_cmd_time = 0;
 
-void error_loop(){
-  while(1){
-    delay(100);
+// === Motion parameters ===
+int8_t left_wheel_dir = 0;
+int8_t right_wheel_dir = 0;
+const double WHEEL_BASE = 0.25;
+
+// === Utility macros ===
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if(temp_rc != RCL_RET_OK){error_loop();} }
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if(temp_rc != RCL_RET_OK){error_loop();} }
+
+void error_loop() {
+  while (1) 
+  delay(100);
+}
+
+int velocityToPWM(double velocity, double max_velocity) {
+  if (velocity > max_velocity) velocity = max_velocity;
+  else if (velocity < -max_velocity) velocity = -max_velocity;
+
+  double norm_vel = velocity / max_velocity;
+  int pwm = (int)(norm_vel * 255);
+  if (pwm > 255) pwm = 255;
+  if (pwm < -255) pwm = -255;
+  return pwm;
+}
+
+// === Motor control ===
+void setMotorSpeed(int speedLeft, int speedRight) {
+  left_wheel_dir = (speedLeft >= 0) ? 1 : -1;
+  right_wheel_dir = (speedRight >= 0) ? 1 : -1;
+  motorL.setSpeed(speedLeft);
+  motorR.setSpeed(speedRight);
+}
+
+// === Encoder ISR ===
+void IRAM_ATTR leftEncoderISR() {
+  left_encoder_count += left_wheel_dir;  // Track direction based on PWM
+}
+
+int32_t readLeftEncoder() {
+  noInterrupts();
+  int32_t count = left_encoder_count;
+  interrupts();
+  return count;
+}
+
+double ticksToRadians(int32_t ticks) {
+  return ((double)ticks / ENCODER_TICKS_PER_REV) * TWO_PI;
+}
+
+
+// === ROS Callbacks ===
+void cmd_vel_callback(const void *msgin) {
+  const sensor_msgs__msg__JointState *msg = (const sensor_msgs__msg__JointState *)msgin;
+  last_cmd_time = millis();
+  const double max_velocity = 0.5;
+
+  if (msg->velocity.size == 2) {
+    int leftPWM = velocityToPWM(msg->velocity.data[0], max_velocity);
+    int rightPWM = velocityToPWM(msg->velocity.data[1], max_velocity);
+    setMotorSpeed(leftPWM, rightPWM);
   }
 }
 
-void setMotorSpeed(int speedLeft, int speedRight);
+void cmd_vel_joy_callback(const void *msgin) {
+  const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
+  last_cmd_time = millis();
 
-//twist message cb
-void cmd_vel_callback(const void *msgin) {
-   const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
-   
-  // Calculate motor speeds based on twist message
-  float linear_raw = msg->linear.x;
-  float angular_raw = msg->angular.z;
+  double linear_raw = msg->linear.x;
+  double angular_raw = msg->angular.z;
 
-  float wheel_base = 0.25;
   int max_pwm = 255;
   int min_pwm = 100;
 
-  // 1) Apply minimum input threshold for raw joystick values
-  float linear = (fabs(linear_raw) < 0.3) ? 0.0 : linear_raw;
-  float angular = (fabs(angular_raw) < 0.3) ? 0.0 : angular_raw;
+  double linear = (fabs(linear_raw) < 0.3) ? 0.0 : linear_raw;
+  double angular = (fabs(angular_raw) < 0.3) ? 0.0 : angular_raw;
 
-  // 2) Calculate raw motor PWM values
-  int leftPWM = (int)((linear - angular * wheel_base / 2.0) * max_pwm);
-  int rightPWM = (int)((linear + angular * wheel_base / 2.0) * max_pwm);
+  int leftPWM = (int)((linear - angular * WHEEL_BASE / 2.0) * max_pwm);
+  int rightPWM = (int)((linear + angular * WHEEL_BASE / 2.0) * max_pwm);
 
-  // 3) Prevent motor stall by enforcing minimum PWM magnitude (except zero)
-  if (leftPWM != 0 && abs(leftPWM) < min_pwm) {
-    leftPWM = (leftPWM > 0) ? min_pwm : -min_pwm;
-  }
-  if (rightPWM != 0 && abs(rightPWM) < min_pwm) {
-    rightPWM = (rightPWM > 0) ? min_pwm : -min_pwm;
-  }
+  if (leftPWM != 0 && abs(leftPWM) < min_pwm) leftPWM = (leftPWM > 0) ? min_pwm : -min_pwm;
+  if (rightPWM != 0 && abs(rightPWM) < min_pwm) rightPWM = (rightPWM > 0) ? min_pwm : -min_pwm;
 
-  // 4) Handle special case for in-place rotation when linear=0 but angular != 0
   if (linear == 0 && angular != 0) {
     leftPWM = (angular > 0) ? -min_pwm : min_pwm;
     rightPWM = (angular > 0) ? min_pwm : -min_pwm;
   }
 
   setMotorSpeed(leftPWM, rightPWM);
-  
 }
 
-void setMotorSpeed(int speedLeft, int speedRight) {
+// === Timer callback ===
+float yaw_offset = 0;
 
-  if (speedLeft != 0) {
-      motorL.setSpeed(speedLeft);
-  } else {
-    motorL.setSpeed(0);
-    } 
-  // Set right motor direction and speed
-  if (speedRight != 0) {
-    motorR.setSpeed(speedRight);
-  }else {
-    motorR.setSpeed(0);
-    } 
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
+  RCLC_UNUSED(last_call_time);
+  if (timer == NULL) return;
+
+  mpu.update();
+
+  unsigned long now = millis();
+  double dt = (now - prev_time_ms) / 1000.0;
+  if (dt <= 0) return;
+  prev_time_ms = now;
+
+  // === Safety stop if no command recently ===
+  if (now - last_cmd_time > 1000) {
+    setMotorSpeed(0, 0);
+  }
+
+  // === Read left encoder ===
+  int32_t encL_ticks = readLeftEncoder();
+  double posL = ticksToRadians(encL_ticks) * left_wheel_dir;
+  double velL = (ticksToRadians(encL_ticks - prev_encL_ticks)) / dt * left_wheel_dir;
+  prev_encL_ticks = encL_ticks;
+
+  // === Get yaw in radians and remove offset ===
+  double new_yaw_deg = mpu.getAngleZ();
+  double yaw_rad = (new_yaw_deg - yaw_offset) * (PI / 180.0);
+
+  // === Calculate delta yaw and mimic right wheel ===
+  static double prev_yaw_rad = 0.0;
+  double delta_yaw = yaw_rad - prev_yaw_rad;
+  prev_yaw_rad = yaw_rad;
+
+  double velR = velL + delta_yaw * WHEEL_BASE / dt;
+  double posR = joint_state_msg.position.data[1] + velR * dt;
+
+  // === Update joint state message ===
+  joint_state_msg.position.data[0] = posL;
+  joint_state_msg.position.data[1] = posR;
+  joint_state_msg.velocity.data[0] = velL;
+  joint_state_msg.velocity.data[1] = velR;
+
+  RCSOFTCHECK(rcl_publish(&joint_state_pub, &joint_state_msg, NULL));
 }
 
 void setup() {
-  delay(1000);
-  set_microros_transports();
   
+  pinMode(LEFT_ENCODER_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER_PIN), leftEncoderISR, RISING);
+  
+  Wire.begin();
+  mpu.begin();
+  mpu.calcOffsets();
+  mpu.update();
+  imu_yaw = mpu.getAngleZ();  // degrees
+  delay(1500);
+
+  set_microros_transports();
 
   allocator = rcl_get_default_allocator();
-
-   //create init_options
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
 
-  // create node
+  // === Init joint_state_msg ===
+  joint_state_msg.position.data = (double *)malloc(2 * sizeof(double));
+  joint_state_msg.velocity.data = (double *)malloc(2 * sizeof(double));
+  joint_state_msg.name.data = (rosidl_runtime_c__String *)malloc(2 * sizeof(rosidl_runtime_c__String));
+
+  joint_state_msg.position.size = joint_state_msg.velocity.size = joint_state_msg.name.size = 2;
+  joint_state_msg.position.capacity = joint_state_msg.velocity.capacity = joint_state_msg.name.capacity = 2;
+
+  joint_state_msg.name.data[0].data = (char *)malloc(50);
+  joint_state_msg.name.data[1].data = (char *)malloc(50);
+  joint_state_msg.name.data[0].capacity = joint_state_msg.name.data[1].capacity = 50;
+  joint_state_msg.name.data[0].size = strlen("left_wheel_joint");
+  joint_state_msg.name.data[1].size = strlen("right_wheel_joint");
+  strcpy(joint_state_msg.name.data[0].data, "left_wheel_joint");
+  strcpy(joint_state_msg.name.data[1].data, "right_wheel_joint");
+
+  prev_encL_ticks = readLeftEncoder();
+  joint_state_msg.position.data[0] = ticksToRadians(prev_encL_ticks);
+  joint_state_msg.position.data[1] = 0.0;
+  joint_state_msg.velocity.data[0] = 0.0;
+  joint_state_msg.velocity.data[1] = 0.0;
+  prev_time_ms = millis();
+
+  // === ROS Setup ===
   RCCHECK(rclc_node_init_default(&node, "diff_drive_esp32", "", &support));
 
-  // create subscriber
+  RCCHECK(rclc_publisher_init_default(
+    &joint_state_pub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+    "/topic_based_joint_states"));
+
   RCCHECK(rclc_subscription_init_default(
     &twist_subscriber,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-    "cmd_vel"));
+    "/diff_cont/cmd_vel"));
 
-  // create executor
+  RCCHECK(rclc_subscription_init_default(
+    &cmd_sub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+    "topic_based_joint_command"));
+
+  const unsigned int timer_timeout = 50;  // 20 Hz
+  RCCHECK(rclc_timer_init_default(
+    &timer,
+    &support,
+    RCL_MS_TO_NS(timer_timeout),
+    timer_callback));
+
   RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_sub, &command_msg, &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &cmd_vel_joy_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_timer(&executor, &timer));
 
-  delay(1000);
 }
 
 void loop() {
-  RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1)));
+  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
   delay(1);
 }
