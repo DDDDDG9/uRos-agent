@@ -17,7 +17,7 @@ CytronMD motorR(PWM_PWM, 32, 33);
 
 // Encoder setup
 #define LEFT_ENCODER_PIN 17
-#define ENCODER_TICKS_PER_REV 133
+#define ENCODER_TICKS_PER_REV 130
 
 volatile int32_t left_encoder_count = 0;
 int32_t prev_encL_ticks = 0;
