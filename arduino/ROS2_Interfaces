@@ -2,6 +2,7 @@
 #include <CytronMotorDriver.h>
 #include <MPU6050_light.h>
 
+#include <stdio.h>
 #include <Wire.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
@@ -19,21 +20,6 @@ CytronMD motorR(PWM_PWM, 32, 33);
 #define LEFT_ENCODER_PIN 17
 #define ENCODER_TICKS_PER_REV 130
 
-volatile int32_t left_encoder_count = 0;
-int32_t prev_encL_ticks = 0;
-
-// MPU6050
-MPU6050 mpu(Wire);
-float yaw_offset = 0;
-float imu_yaw = 0;
-
-// Motion
-int8_t left_wheel_dir = 0;
-int8_t right_wheel_dir = 0;
-const double WHEEL_BASE = 0.25;
-unsigned long prev_time_ms = 0;
-unsigned long last_cmd_time = 0;
-
 // Micro-ROS setup
 rcl_publisher_t joint_state_pub;
 sensor_msgs__msg__JointState joint_state_msg;
@@ -50,12 +36,44 @@ rclc_support_t support;
 rcl_node_t node;
 rcl_timer_t timer;
 
+volatile int32_t left_encoder_count = 0;
+int32_t prev_encL_ticks = 0;
+
+// MPU6050
+MPU6050 mpu(Wire);
+float yaw_offset = 0;
+
+// Motion
+int8_t left_wheel_dir = 0;
+int8_t right_wheel_dir = 0;
+const double WHEEL_BASE = 0.25;
+unsigned long prev_time_ms = 0;
+unsigned long last_cmd_time = 0;
+
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
+
 
 void error_loop() {
   while (1) delay(100);
 }
+
+// === Encoder ===
+void IRAM_ATTR leftEncoderISR() {
+  left_encoder_count += left_wheel_dir;
+}
+
+int32_t readLeftEncoder() {
+  noInterrupts();
+  int32_t count = left_encoder_count;
+  interrupts();
+  return count;
+}
+
+double ticksToRadians(int32_t ticks) {
+  return ((double)ticks / ENCODER_TICKS_PER_REV) * TWO_PI;
+}
+
 
 // === Motor control ===
 int velocityToPWM(double velocity, double max_velocity) {
@@ -75,21 +93,6 @@ void setMotorSpeed(int speedLeft, int speedRight) {
   motorR.setSpeed(speedRight);
 }
 
-// === Encoder ===
-void IRAM_ATTR leftEncoderISR() {
-  left_encoder_count += left_wheel_dir;
-}
-
-int32_t readLeftEncoder() {
-  noInterrupts();
-  int32_t count = left_encoder_count;
-  interrupts();
-  return count;
-}
-
-double ticksToRadians(int32_t ticks) {
-  return ((double)ticks / ENCODER_TICKS_PER_REV) * TWO_PI;
-}
 
 // === Callbacks ===
 void cmd_vel_callback(const void *msgin) {
@@ -177,44 +180,13 @@ void setup() {
   Wire.begin();
   mpu.begin();
   mpu.calcOffsets();
-  mpu.update();
-  imu_yaw = mpu.getAngleZ();  // degrees
   delay(1500);
+  mpu.update();
+
 
   set_microros_transports();
   allocator = rcl_get_default_allocator();
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-  RCCHECK(rclc_node_init_default(&node, "diff_drive_esp32", "", &support));
-
-  // === Joint State Publisher ===
-  RCCHECK(rclc_publisher_init_default(
-    &joint_state_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
-    "/topic_based_joint_states"));
-
-  RCCHECK(rclc_subscription_init_default(
-    &twist_subscriber,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
-    "/diff_cont/cmd_vel"));
-
-  RCCHECK(rclc_subscription_init_default(
-    &cmd_sub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
-    "topic_based_joint_command"));
-
-  RCCHECK(rclc_timer_init_default(
-    &timer,
-    &support,
-    RCL_MS_TO_NS(50),  // 20Hz
-    timer_callback));
-
-  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_sub, &command_msg, &cmd_vel_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &cmd_vel_joy_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer));
 
   // Allocate JointState arrays
   joint_state_msg.position.data = (double *)malloc(2 * sizeof(double));
@@ -240,6 +212,34 @@ void setup() {
   joint_state_msg.velocity.data[0] = 0.0;
   joint_state_msg.velocity.data[1] = 0.0;
   prev_time_ms = millis();
+
+  RCCHECK(rclc_node_init_default(&node, "diff_drive_esp32", "", &support));
+
+  // === Joint State Publisher ===
+  RCCHECK(rclc_publisher_init_default(
+    &joint_state_pub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+    "/topic_based_joint_states"));
+
+  RCCHECK(rclc_subscription_init_default(
+    &twist_subscriber,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+    "/diff_cont/cmd_vel"));
+
+  RCCHECK(rclc_subscription_init_default(
+    &cmd_sub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+    "topic_based_joint_command"));
+
+  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(50), timer_callback));
+
+  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_sub, &command_msg, &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &cmd_vel_joy_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_timer(&executor, &timer));
 }
 
 void loop() {
