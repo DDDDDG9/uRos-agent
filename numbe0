@@ -1,3 +1,4 @@
+// === Includes ===
 #include <micro_ros_arduino.h>
 #include <CytronMotorDriver.h>
 #include <MPU6050_light.h>
@@ -11,17 +12,17 @@
 
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/joint_state.h>
-#include <std_msgs/msg/int32.h>  // Added for encoder ticks
+#include <std_msgs/msg/int32.h>
 
-// Motor driver pins
+// === Motor driver pins ===
 CytronMD motorL(PWM_PWM, 26, 27);
 CytronMD motorR(PWM_PWM, 32, 33);
 
-// Encoder setup
+// === Encoder setup ===
 #define LEFT_ENCODER_PIN 17
 #define ENCODER_TICKS_PER_REV 130
 
-// Micro-ROS setup
+// === Micro-ROS setup ===
 rcl_publisher_t joint_state_pub;
 sensor_msgs__msg__JointState joint_state_msg;
 
@@ -40,20 +41,22 @@ rclc_support_t support;
 rcl_node_t node;
 rcl_timer_t timer;
 
+// === Variables ===
 volatile int32_t left_encoder_count = 0;
 int32_t prev_encL_ticks = 0;
 
-// MPU6050
+// === MPU6050 ===
 MPU6050 mpu(Wire);
 float yaw_offset = 0;
 
-// Motion
+// === Motion parameters ===
 int8_t left_wheel_dir = 0;
 int8_t right_wheel_dir = 0;
 const double WHEEL_BASE = 0.25;
 unsigned long prev_time_ms = 0;
 unsigned long last_cmd_time = 0;
 
+// === Error handling macros ===
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
 
@@ -61,7 +64,7 @@ void error_loop() {
   while (1) delay(100);
 }
 
-// === Encoder ===
+// === Encoder ISR ===
 void IRAM_ATTR leftEncoderISR() {
   left_encoder_count += left_wheel_dir;
 }
@@ -135,7 +138,7 @@ void cmd_vel_joy_callback(const void *msgin) {
   setMotorSpeed(leftPWM, rightPWM);
 }
 
-// === Timer ===
+// === Timer callback ===
 void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   RCLC_UNUSED(last_call_time);
   if (timer == NULL) return;
@@ -156,7 +159,7 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   double velL = (ticksToRadians(encL_ticks - prev_encL_ticks)) / dt;
   prev_encL_ticks = encL_ticks;
 
-  // Yaw and right wheel estimation
+  // Right wheel estimation using yaw
   double yaw_rad = (mpu.getAngleZ() - yaw_offset) * (PI / 180.0);
   static double prev_yaw_rad = 0;
   double delta_yaw = yaw_rad - prev_yaw_rad;
@@ -165,7 +168,7 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
   double velR = velL + delta_yaw * WHEEL_BASE / dt;
   double posR = joint_state_msg.position.data[1] + velR * dt;
 
-  // Publish joint state
+  // Publish joint states
   joint_state_msg.position.data[0] = posL;
   joint_state_msg.position.data[1] = posR;
   joint_state_msg.velocity.data[0] = velL;
@@ -173,11 +176,12 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
 
   RCSOFTCHECK(rcl_publish(&joint_state_pub, &joint_state_msg, NULL));
 
-  // Publish left encoder tick count
+  // Publish encoder ticks
   left_encoder_msg.data = encL_ticks;
   RCSOFTCHECK(rcl_publish(&left_encoder_pub, &left_encoder_msg, NULL));
 }
 
+// === Setup ===
 void setup() {
   pinMode(LEFT_ENCODER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER_PIN), leftEncoderISR, RISING);
@@ -192,7 +196,7 @@ void setup() {
   allocator = rcl_get_default_allocator();
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
 
-  // Allocate JointState arrays
+  // Allocate JointState message memory
   joint_state_msg.position.data = (double *)malloc(2 * sizeof(double));
   joint_state_msg.velocity.data = (double *)malloc(2 * sizeof(double));
   joint_state_msg.name.data = (rosidl_runtime_c__String *)malloc(2 * sizeof(rosidl_runtime_c__String));
@@ -209,7 +213,7 @@ void setup() {
   joint_state_msg.name.data[0].size = strlen("left_wheel_joint");
   joint_state_msg.name.data[1].size = strlen("right_wheel_joint");
 
-  // Initial encoder
+  // Initialize encoder
   prev_encL_ticks = readLeftEncoder();
   joint_state_msg.position.data[0] = ticksToRadians(prev_encL_ticks);
   joint_state_msg.position.data[1] = 0.0;
@@ -217,37 +221,33 @@ void setup() {
   joint_state_msg.velocity.data[1] = 0.0;
   prev_time_ms = millis();
 
+  // Micro-ROS node
   RCCHECK(rclc_node_init_default(&node, "diff_drive_esp32", "", &support));
 
-  // Joint State publisher (use standard topic name for RViz compatibility)
+  // Publishers
   RCCHECK(rclc_publisher_init_default(
-    &joint_state_pub,
-    &node,
+    &joint_state_pub, &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
     "/joint_states"));
 
-  // Left encoder tick count publisher
   RCCHECK(rclc_publisher_init_default(
-    &left_encoder_pub,
-    &node,
+    &left_encoder_pub, &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
     "left_encoder_ticks"));
 
   // Subscriptions
   RCCHECK(rclc_subscription_init_default(
-    &twist_subscriber,
-    &node,
+    &twist_subscriber, &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
     "/diff_cont/cmd_vel"));
 
   RCCHECK(rclc_subscription_init_default(
-    &cmd_sub,
-    &node,
+    &cmd_sub, &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
     "topic_based_joint_command"));
 
-  // Timer
-  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(50), timer_callback));
+  // ✅ Updated: Use new timer function with allocator
+  RCCHECK(rclc_timer_init_default2(&timer, &support, RCL_MS_TO_NS(50), timer_callback, &allocator));
 
   // Executor
   RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
@@ -256,6 +256,7 @@ void setup() {
   RCCHECK(rclc_executor_add_timer(&executor, &timer));
 }
 
+// === Loop ===
 void loop() {
   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
   delay(1);
