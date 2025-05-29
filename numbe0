@@ -1,0 +1,262 @@
+#include <micro_ros_arduino.h>
+#include <CytronMotorDriver.h>
+#include <MPU6050_light.h>
+
+#include <stdio.h>
+#include <Wire.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+
+#include <geometry_msgs/msg/twist.h>
+#include <sensor_msgs/msg/joint_state.h>
+#include <std_msgs/msg/int32.h>  // Added for encoder ticks
+
+// Motor driver pins
+CytronMD motorL(PWM_PWM, 26, 27);
+CytronMD motorR(PWM_PWM, 32, 33);
+
+// Encoder setup
+#define LEFT_ENCODER_PIN 17
+#define ENCODER_TICKS_PER_REV 130
+
+// Micro-ROS setup
+rcl_publisher_t joint_state_pub;
+sensor_msgs__msg__JointState joint_state_msg;
+
+rcl_publisher_t left_encoder_pub;
+std_msgs__msg__Int32 left_encoder_msg;
+
+rcl_subscription_t twist_subscriber;
+geometry_msgs__msg__Twist twist_msg;
+
+rcl_subscription_t cmd_sub;
+sensor_msgs__msg__JointState command_msg;
+
+rclc_executor_t executor;
+rcl_allocator_t allocator;
+rclc_support_t support;
+rcl_node_t node;
+rcl_timer_t timer;
+
+volatile int32_t left_encoder_count = 0;
+int32_t prev_encL_ticks = 0;
+
+// MPU6050
+MPU6050 mpu(Wire);
+float yaw_offset = 0;
+
+// Motion
+int8_t left_wheel_dir = 0;
+int8_t right_wheel_dir = 0;
+const double WHEEL_BASE = 0.25;
+unsigned long prev_time_ms = 0;
+unsigned long last_cmd_time = 0;
+
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
+
+void error_loop() {
+  while (1) delay(100);
+}
+
+// === Encoder ===
+void IRAM_ATTR leftEncoderISR() {
+  left_encoder_count += left_wheel_dir;
+}
+
+int32_t readLeftEncoder() {
+  noInterrupts();
+  int32_t count = left_encoder_count;
+  interrupts();
+  return count;
+}
+
+double ticksToRadians(int32_t ticks) {
+  return ((double)ticks / ENCODER_TICKS_PER_REV) * TWO_PI;
+}
+
+// === Motor control ===
+int velocityToPWM(double velocity, double max_velocity) {
+  if (velocity > max_velocity) velocity = max_velocity;
+  if (velocity < -max_velocity) velocity = -max_velocity;
+
+  double norm_vel = velocity / max_velocity;
+  int pwm = (int)(norm_vel * 255);
+  pwm = constrain(pwm, -255, 255);
+  return pwm;
+}
+
+void setMotorSpeed(int speedLeft, int speedRight) {
+  left_wheel_dir = (speedLeft >= 0) ? 1 : -1;
+  right_wheel_dir = (speedRight >= 0) ? 1 : -1;
+  motorL.setSpeed(speedLeft);
+  motorR.setSpeed(speedRight);
+}
+
+// === Callbacks ===
+void cmd_vel_callback(const void *msgin) {
+  const sensor_msgs__msg__JointState *msg = (const sensor_msgs__msg__JointState *)msgin;
+  last_cmd_time = millis();
+
+  const double max_velocity = 0.5;
+  if (msg->velocity.size == 2) {
+    int leftPWM = velocityToPWM(msg->velocity.data[0], max_velocity);
+    int rightPWM = velocityToPWM(msg->velocity.data[1], max_velocity);
+    setMotorSpeed(leftPWM, rightPWM);
+  }
+}
+
+void cmd_vel_joy_callback(const void *msgin) {
+  const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
+  last_cmd_time = millis();
+
+  double linear_raw = msg->linear.x;
+  double angular_raw = msg->angular.z;
+
+  int max_pwm = 255;
+  int min_pwm = 100;
+
+  double linear = (fabs(linear_raw) < 0.3) ? 0.0 : linear_raw;
+  double angular = (fabs(angular_raw) < 0.3) ? 0.0 : angular_raw;
+
+  int leftPWM = (int)((linear - angular * WHEEL_BASE / 2.0) * max_pwm);
+  int rightPWM = (int)((linear + angular * WHEEL_BASE / 2.0) * max_pwm);
+
+  if (leftPWM != 0 && abs(leftPWM) < min_pwm) leftPWM = (leftPWM > 0) ? min_pwm : -min_pwm;
+  if (rightPWM != 0 && abs(rightPWM) < min_pwm) rightPWM = (rightPWM > 0) ? min_pwm : -min_pwm;
+
+  if (linear == 0 && angular != 0) {
+    leftPWM = (angular > 0) ? -min_pwm : min_pwm;
+    rightPWM = (angular > 0) ? min_pwm : -min_pwm;
+  }
+
+  setMotorSpeed(leftPWM, rightPWM);
+}
+
+// === Timer ===
+void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+  RCLC_UNUSED(last_call_time);
+  if (timer == NULL) return;
+
+  mpu.update();
+  unsigned long now = millis();
+  double dt = (now - prev_time_ms) / 1000.0;
+  if (dt <= 0) return;
+  prev_time_ms = now;
+
+  if (now - last_cmd_time > 1000) {
+    setMotorSpeed(0, 0);
+  }
+
+  // Left wheel
+  int32_t encL_ticks = readLeftEncoder();
+  double posL = ticksToRadians(encL_ticks);
+  double velL = (ticksToRadians(encL_ticks - prev_encL_ticks)) / dt;
+  prev_encL_ticks = encL_ticks;
+
+  // Yaw and right wheel estimation
+  double yaw_rad = (mpu.getAngleZ() - yaw_offset) * (PI / 180.0);
+  static double prev_yaw_rad = 0;
+  double delta_yaw = yaw_rad - prev_yaw_rad;
+  prev_yaw_rad = yaw_rad;
+
+  double velR = velL + delta_yaw * WHEEL_BASE / dt;
+  double posR = joint_state_msg.position.data[1] + velR * dt;
+
+  // Publish joint state
+  joint_state_msg.position.data[0] = posL;
+  joint_state_msg.position.data[1] = posR;
+  joint_state_msg.velocity.data[0] = velL;
+  joint_state_msg.velocity.data[1] = velR;
+
+  RCSOFTCHECK(rcl_publish(&joint_state_pub, &joint_state_msg, NULL));
+
+  // Publish left encoder tick count
+  left_encoder_msg.data = encL_ticks;
+  RCSOFTCHECK(rcl_publish(&left_encoder_pub, &left_encoder_msg, NULL));
+}
+
+void setup() {
+  pinMode(LEFT_ENCODER_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER_PIN), leftEncoderISR, RISING);
+
+  Wire.begin();
+  mpu.begin();
+  mpu.calcOffsets();
+  delay(1500);
+  mpu.update();
+
+  set_microros_transports();
+  allocator = rcl_get_default_allocator();
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // Allocate JointState arrays
+  joint_state_msg.position.data = (double *)malloc(2 * sizeof(double));
+  joint_state_msg.velocity.data = (double *)malloc(2 * sizeof(double));
+  joint_state_msg.name.data = (rosidl_runtime_c__String *)malloc(2 * sizeof(rosidl_runtime_c__String));
+
+  joint_state_msg.position.size = joint_state_msg.velocity.size = joint_state_msg.name.size = 2;
+  joint_state_msg.position.capacity = joint_state_msg.velocity.capacity = joint_state_msg.name.capacity = 2;
+
+  joint_state_msg.name.data[0].data = (char *)malloc(50);
+  joint_state_msg.name.data[1].data = (char *)malloc(50);
+  joint_state_msg.name.data[0].capacity = joint_state_msg.name.data[1].capacity = 50;
+
+  strcpy(joint_state_msg.name.data[0].data, "left_wheel_joint");
+  strcpy(joint_state_msg.name.data[1].data, "right_wheel_joint");
+  joint_state_msg.name.data[0].size = strlen("left_wheel_joint");
+  joint_state_msg.name.data[1].size = strlen("right_wheel_joint");
+
+  // Initial encoder
+  prev_encL_ticks = readLeftEncoder();
+  joint_state_msg.position.data[0] = ticksToRadians(prev_encL_ticks);
+  joint_state_msg.position.data[1] = 0.0;
+  joint_state_msg.velocity.data[0] = 0.0;
+  joint_state_msg.velocity.data[1] = 0.0;
+  prev_time_ms = millis();
+
+  RCCHECK(rclc_node_init_default(&node, "diff_drive_esp32", "", &support));
+
+  // Joint State publisher (use standard topic name for RViz compatibility)
+  RCCHECK(rclc_publisher_init_default(
+    &joint_state_pub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+    "/joint_states"));
+
+  // Left encoder tick count publisher
+  RCCHECK(rclc_publisher_init_default(
+    &left_encoder_pub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+    "left_encoder_ticks"));
+
+  // Subscriptions
+  RCCHECK(rclc_subscription_init_default(
+    &twist_subscriber,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+    "/diff_cont/cmd_vel"));
+
+  RCCHECK(rclc_subscription_init_default(
+    &cmd_sub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
+    "topic_based_joint_command"));
+
+  // Timer
+  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(50), timer_callback));
+
+  // Executor
+  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_sub, &command_msg, &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &twist_subscriber, &twist_msg, &cmd_vel_joy_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_timer(&executor, &timer));
+}
+
+void loop() {
+  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+  delay(1);
+}
